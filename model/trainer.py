@@ -103,7 +103,9 @@ class Trainer:
                 },
             )
 
+        # 混合精度
         self.precision = self.accelerator.state.mixed_precision
+        # 如果是fp16或bf16，则转换为fp32，加速计算
         self.precision = self.precision.replace("no", "fp32")
 
         self.model = model
@@ -112,6 +114,7 @@ class Trainer:
             self.ema_model = EMA(model, include_online_model=False, **ema_kwargs)
 
             self.ema_model.to(self.accelerator.device)
+            # 半精度优化
             if self.accelerator.state.distributed_type in ["DEEPSPEED", "FSDP"]:
                 self.ema_model.half()
 
@@ -135,6 +138,7 @@ class Trainer:
         
         self.grad_ckpt = grad_ckpt
 
+        # 8bit优化器，减少显存使用，adam8优化，deepspeed(分布式训练)参数优化
         if bnb_optimizer:
             import bitsandbytes as bnb
 
@@ -151,12 +155,14 @@ class Trainer:
         self.model, self.optimizer, self.scheduler, self.train_dataloader = self.accelerator.prepare(self.model, self.optimizer, self.scheduler, self.train_dataloader)
 
     def get_scheduler(self):
+        # 初始化学习率调度器
         warmup_steps = (
             self.num_warmup_updates * self.accelerator.num_processes
         )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
         total_steps = len(self.train_dataloader) * self.epochs / self.grad_accumulation_steps
         decay_steps = total_steps - warmup_steps
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+        # 常数学习率调度器
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_steps)
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_steps]
@@ -166,17 +172,19 @@ class Trainer:
         total_steps = len(self.train_dataloader) * self.epochs / self.grad_accumulation_steps
         self.scheduler = ConstantLR(self.optimizer, factor=1, total_iters=total_steps)
 
+    # 获取数据加载器
+    # 这里使用DiffusionDataset类来加载数据
     def get_dataloader(self):
         print(self.args)
         dd = DiffusionDataset(self.args.file_path, self.args.max_frames, self.args.min_frames, self.args.sampling_rate, self.args.downsample_rate, self.precision)
         self.train_dataloader = DataLoader(
             dataset=dd,
             batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-            collate_fn=dd.custom_collate_fn,
-            persistent_workers=True
+            shuffle=True, # 是否打乱数据
+            num_workers=4, # 数据加载器的工作线程数
+            pin_memory=True, # 是否将数据加载到固定内存中
+            collate_fn=dd.custom_collate_fn, # 自定义数据加载器的合并函数
+            persistent_workers=True # 是否在数据加载器中使用持久化工作线程，保持worker的进程
         )
 
 
@@ -260,6 +268,7 @@ class Trainer:
         start_step = self.load_checkpoint()
         global_step = start_step
 
+        # 有预训练就跳过，否则从零开始
         if resumable_with_seed > 0:
             orig_epoch_step = len(train_dataloader)
             skipped_epoch = int(start_step // orig_epoch_step)
@@ -271,6 +280,8 @@ class Trainer:
         for epoch in range(skipped_epoch, self.epochs):
             self.model.train()
             if resumable_with_seed > 0 and epoch == skipped_epoch:
+                # 跳过前几个epoch
+                # tqdm进度条
                 progress_bar = tqdm(
                     skipped_dataloader,
                     desc=f"Epoch {epoch+1}/{self.epochs}",
@@ -290,22 +301,27 @@ class Trainer:
                 )
 
             for batch in progress_bar:
+                # 加载梯度累计到显存上
+                # 自动处理GPU和梯度处理的同步
                 with self.accelerator.accumulate(self.model):
-                    text_inputs = batch["lrc"]
-                    mel_spec = batch["latent"].permute(0, 2, 1)
-                    mel_lengths = batch["latent_lengths"]
-                    style_prompt = batch["prompt"]
-                    style_prompt_lens = batch["prompt_lengths"]
-                    start_time = batch["start_time"]
+                    text_inputs = batch["lrc"] # 文本输入
+                    mel_spec = batch["latent"].permute(0, 2, 1) # 频谱图潜在层
+                    mel_lengths = batch["latent_lengths"] # 频谱图长度
+                    style_prompt = batch["prompt"] # 风格提示
+                    style_prompt_lens = batch["prompt_lengths"] # 风格提示长度
+                    start_time = batch["start_time"] # 开始时间
 
+                    # 前向传播
                     loss, cond, pred = self.model(
                         mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler,
                         style_prompt=style_prompt,
                         style_prompt_lens=style_prompt_lens,
                         grad_ckpt=self.grad_ckpt, start_time=start_time
                     )
+                    # 反向传播
                     self.accelerator.backward(loss)
 
+                    # 梯度裁剪，确保分布式同步
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 

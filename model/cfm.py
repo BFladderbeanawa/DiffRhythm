@@ -165,15 +165,17 @@ class CFM(nn.Module):
             assert text.shape[0] == batch
 
         # duration
-        cond_mask = lens_to_mask(lens)
+        cond_mask = lens_to_mask(lens) # 生成掩码
         if edit_mask is not None:
-            cond_mask = cond_mask & edit_mask
+            cond_mask = cond_mask & edit_mask #自定义掩码
 
         latent_pred_segments = torch.tensor(latent_pred_segments).to(cond.device)
+        # 生成固定跨度掩码
         fixed_span_mask = custom_mask_from_start_end_indices(cond_seq_len, latent_pred_segments, device=cond.device, max_seq_len=duration)
         fixed_span_mask = fixed_span_mask.unsqueeze(-1)
         step_cond = torch.where(fixed_span_mask, torch.zeros_like(cond), cond)
 
+        # 限制时长，防止内存溢出
         if isinstance(duration, int):
             duration = torch.full((batch_infer_num,), duration, device=device, dtype=torch.long)
 
@@ -191,8 +193,10 @@ class CFM(nn.Module):
 
         # test for no ref audio
         if no_ref_audio:
+            # 没有参照音频就从噪声开始
             cond = torch.zeros_like(cond)
 
+        # 转并行
         cond = cond.repeat(batch_infer_num, 1, 1)
         step_cond = step_cond.repeat(batch_infer_num, 1, 1)
         text = text.repeat(batch_infer_num, 1)
@@ -203,18 +207,21 @@ class CFM(nn.Module):
 
         def fn(t, x):
             # predict flow
+            # 有条件预测
             pred = self.transformer(
                 x=x, cond=step_cond, text=text, time=t, drop_audio_cond=False, drop_text=False, drop_prompt=False,
                 style_prompt=style_prompt, start_time=start_time
             )
+            
             if cfg_strength < 1e-5:
                 return pred
-
+            
+            #无条件预测
             null_pred = self.transformer(
                 x=x, cond=step_cond, text=text, time=t, drop_audio_cond=True, drop_text=True, drop_prompt=False,
                 style_prompt=negative_style_prompt, start_time=start_time
             )
-            return pred + (pred - null_pred) * cfg_strength
+            return pred + (pred - null_pred) * cfg_strength # 计算条件流预测：相减得到条件本身，细化后（乘以cfg_strength）得到最终的预测
 
         # noise input
         # to make sure batch inference result is same with different batch size, and for sure single inference
@@ -226,25 +233,35 @@ class CFM(nn.Module):
             y0.append(torch.randn(dur, self.num_channels, device=self.device, dtype=step_cond.dtype))
         y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
-        t_start = 0
+        t_start = 0 #纯噪声状态
 
         # duplicate test corner for inner time step oberservation
+        # 测试模式
         if duplicate_test:
             t_start = t_inter
+            # 线性插值数值状态
             y0 = (1 - t_start) * y0 + t_start * test_cond
+            # 调整步数
             steps = int(steps * (1 - t_start))
         
+        # 线性时间从t_start开始到1的均匀分布
         t = torch.linspace(t_start, 1, steps, device=self.device, dtype=step_cond.dtype)
+        # sway sampling，使用cos函数进行平滑采样，非线性
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
+        # odeint求解积分向量场
+        # 计算轨迹
         trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
 
+        # 取最后一个时间步的结果作为输出
         sampled = trajectory[-1]
         out = sampled
+        # 固定跨度掩码
         out = torch.where(fixed_span_mask, out, cond)
 
         if exists(vocoder):
+            # 如果有vocoder，将输出转换为音频
             out = out.permute(0, 2, 1)
             out = vocoder(out)
 
@@ -273,6 +290,7 @@ class CFM(nn.Module):
 
         # get a random span to mask out for training conditionally
         frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
+        # 生成随机跨度掩码
         rand_span_mask = mask_from_frac_lengths(lens, frac_lengths, self.max_frames)
 
         if exists(mask):
@@ -286,12 +304,16 @@ class CFM(nn.Module):
 
         # time step
         time = torch.normal(mean=0, std=1, size=(batch,), device=self.device)
+        # 把当前时间步映射到0-1之间
         time = torch.nn.functional.sigmoid(time)
         # TODO. noise_scheduler
 
         # sample xt (φ_t(x) in the paper)
+        # 维度拓展
         t = time.unsqueeze(-1).unsqueeze(-1)
+        # 线性插值的插值路径
         φ = (1 - t) * x0 + t * x1
+        # 计算流向量
         flow = x1 - x0
 
         # only predict what is within the random mask span for infilling

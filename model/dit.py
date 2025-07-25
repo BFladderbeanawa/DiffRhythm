@@ -102,7 +102,7 @@ class DiT(nn.Module):
         depth=8,
         heads=8,
         dim_head=64,
-        dropout=0.1,
+        dropout=0.1, # Transformer
         ff_mult=4,
         mel_dim=100,
         text_num_embeds=256,
@@ -116,8 +116,8 @@ class DiT(nn.Module):
         self.max_frames = max_frames
 
         cond_dim = 512
-        self.time_embed = TimestepEmbedding(cond_dim)
-        self.start_time_embed = TimestepEmbedding(cond_dim)
+        self.time_embed = TimestepEmbedding(cond_dim) # 时间序列
+        self.start_time_embed = TimestepEmbedding(cond_dim) # 时间序列
         if text_dim is None:
             text_dim = mel_dim
         self.text_embed = TextEmbedding(text_num_embeds, text_dim, conv_layers=conv_layers, max_pos=self.max_frames)
@@ -127,14 +127,16 @@ class DiT(nn.Module):
         self.depth = depth
 
         llama_config = LlamaConfig(hidden_size=dim, intermediate_size=dim * ff_mult, hidden_act='silu', max_position_embeddings=self.max_frames)
-        llama_config._attn_implementation = 'sdpa'
+        # 引入llama作baseline，通过llama做transformer组件，激活函数=silu
+        llama_config._attn_implementation = 'sdpa' # scaled dot product attention
         self.transformer_blocks = nn.ModuleList(
             [LlamaDecoderLayer(llama_config, layer_idx=i) for i in range(depth)]
-        )
+        ) # Transformer blocks, dpeth个，作解码器层
         self.rotary_emb = LlamaRotaryEmbedding(config=llama_config)
         self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
+        # 长距离残差，用于连接模型的不同部分
 
-        self.text_fusion_linears = nn.ModuleList(
+        self.text_fusion_linears = nn.ModuleList( # 文本融合线性层，包括序列层，线性层，SiLU激活函数，共计depth//2个，用文本映射音乐
             [
                 nn.Sequential(
                     nn.Linear(cond_dim, dim),
@@ -142,23 +144,27 @@ class DiT(nn.Module):
                 ) for i in range(depth // 2)
             ]
         )
+
+        # 从计算图中分离并初始化，变为全零层。
         for layer in self.text_fusion_linears:
             for p in layer.parameters():
                 p.detach().zero_()
 
+        # 归一化层，AdaLayerNormZero_Final
         self.norm_out = AdaLayerNormZero_Final(dim, cond_dim)  # final modulation
+        # 投射维度，将当前隐藏维度dim投射到mel_dim
         self.proj_out = nn.Linear(dim, mel_dim)
 
     def forward_timestep_invariant(self, text, seq_len, drop_text, start_time):
-        s_t = self.start_time_embed(start_time)
-        text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
+        s_t = self.start_time_embed(start_time) # 时间嵌入
+        text_embed = self.text_embed(text, seq_len, drop_text=drop_text) # 文本嵌入
         text_residuals = []
         for layer in self.text_fusion_linears:
-            text_residual = layer(text_embed)
+            text_residual = layer(text_embed) # 为后续diffusion模型提供文本残差
             text_residuals.append(text_residual)
         return s_t, text_embed, text_residuals
 
-
+# 前向神经网络
     def forward(
         self,
         x: float["b n d"],  # nosied input audio  # noqa: F722
@@ -174,7 +180,7 @@ class DiT(nn.Module):
 
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
-            time = time.repeat(batch)
+            time = time.repeat(batch) # 给每个数据加入时间步
 
         # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
         t = self.time_embed(time)
@@ -183,29 +189,31 @@ class DiT(nn.Module):
         text_embed = self.text_embed(text, seq_len, drop_text=drop_text)
 
         if drop_prompt:
-            style_prompt = torch.zeros_like(style_prompt)
+            style_prompt = torch.zeros_like(style_prompt) # 训练随机丢掉一些风格提示（也许增强鲁棒性？
         
         style_embed = style_prompt # [b, 512]
 
         x = self.input_embed(x, cond, text_embed, style_embed, c, drop_audio_cond=drop_audio_cond)
-
+        # 全部合并成X塞进去
         if self.long_skip_connection is not None:
-            residual = x
+            residual = x # 保存残差，后续用于长距离残差连接
 
         pos_ids = torch.arange(x.shape[1], device=x.device)
         pos_ids = pos_ids.unsqueeze(0).repeat(x.shape[0], 1)
-        rotary_embed = self.rotary_emb(x, pos_ids)
+        rotary_embed = self.rotary_emb(x, pos_ids) # 计算后旋转嵌入
         
         attention_mask = torch.ones(
             (batch, seq_len),
             dtype=torch.bool,
             device=x.device,
-        )
-        attention_mask = _prepare_decoder_attention_mask(
+        ) # 确保所有位置之间都有注意力相连
+        attention_mask = _prepare_decoder_attention_mask( #转化成其它的掩码形式（nonCasual Mask，主要是音符之间并没有因果关系）
             attention_mask,
             (batch, seq_len),
             x,
         )
+
+        # Transformer blocks
 
         for i, block in enumerate(self.transformer_blocks):
             x, *_ = block(x, attention_mask=attention_mask, position_embeddings=rotary_embed)

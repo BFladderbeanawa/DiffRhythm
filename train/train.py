@@ -18,6 +18,8 @@ from importlib.resources import files
 
 from model import CFM, DiT, Trainer
 
+# DiT: Transformer backbone using Llama blocks
+
 from prefigure.prefigure import get_all_args
 import json
 import os
